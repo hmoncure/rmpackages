@@ -9,6 +9,7 @@ const bcrypt = require('bcryptjs');
 const { pool, migrate, tx } = require('./lib/db');
 const storage = require('./lib/storage');
 const mail = require('./lib/mail');
+const push = require('./lib/push');
 
 const PORT = Number(process.env.PORT || 3020);
 const APP_URL = (process.env.APP_URL || `http://localhost:${PORT}`).replace(/\/$/, '');
@@ -249,6 +250,9 @@ function readFields(body, { requireDescription }) {
       const v = clean(body[k], 10);
       if (v && !isDate(v)) throw new HttpError(400, 'Expected date must be YYYY-MM-DD.');
       f[k] = v;
+    } else if (k === 'tracking') {
+      const v = clean(body[k], 100);
+      f[k] = v ? v.replace(/\s+/g, '').toUpperCase() : null;
     } else if (k === 'recipient_id') {
       f[k] = body[k] ? Number(body[k]) : null;
     } else {
@@ -531,7 +535,57 @@ app.post('/api/import', requireService, express.json({ limit: '1mb' }), wrap(asy
     }
   }
   const summary = results.reduce((a, r) => { a[r.result] = (a[r.result] || 0) + 1; return a; }, {});
-  res.json({ summary, results });
+  const pushed = await pushTrackingNeeded().catch((e) => { console.error('[push] tracking-needed', e); return 0; });
+  res.json({ summary, results, pushed });
+}));
+
+// Amazon never emails its TBA tracking number, so ask the admins (who can see Amazon's
+// tracking page) to paste it in. One push per package, ever.
+async function pushTrackingNeeded() {
+  const r = await pool.query(
+    `UPDATE package SET tracking_push_sent_at = now()
+      WHERE status = 'expected' AND tracking IS NULL AND tracking_push_sent_at IS NULL AND vendor ILIKE 'amazon%'
+      RETURNING id, description, expected_date`);
+  for (const p of r.rows) {
+    await push.sendToAdmins({
+      title: 'Tracking number needed',
+      body: `${p.description}${p.expected_date ? ` — due ${p.expected_date.slice(5).replace('-', '/')}` : ''}. Tap to add Amazon's TBA number.`,
+      url: `/#/p/${p.id}/tracking`, tag: `trk-${p.id}`,
+    });
+  }
+  return r.rowCount;
+}
+
+// ---------- push subscriptions ----------
+app.get('/api/push/key', requireUser, wrap(async (req, res) => {
+  const n = (await pool.query('SELECT count(*)::int AS n FROM push_subscription WHERE person_id = $1', [req.user.id])).rows[0].n;
+  res.json({ key: push.publicKey, enabled: push.enabled, my_devices: n });
+}));
+app.post('/api/push/subscribe', requireUser, express.json(), wrap(async (req, res) => {
+  const s = req.body.subscription || {};
+  const endpoint = clean(s.endpoint, 1000);
+  const p256dh = clean(s.keys && s.keys.p256dh, 200);
+  const auth = clean(s.keys && s.keys.auth, 100);
+  if (!endpoint || !/^https:\/\//.test(endpoint) || !p256dh || !auth) throw new HttpError(400, 'Bad subscription.');
+  await pool.query(
+    `INSERT INTO push_subscription (person_id, endpoint, p256dh, auth, device) VALUES ($1,$2,$3,$4,$5)
+     ON CONFLICT (endpoint) DO UPDATE SET person_id = EXCLUDED.person_id, p256dh = EXCLUDED.p256dh, auth = EXCLUDED.auth,
+       device = EXCLUDED.device, failures = 0`,
+    [req.user.id, endpoint, p256dh, auth, clean(req.get('User-Agent'), 300)]);
+  res.json({ ok: true });
+}));
+app.post('/api/push/unsubscribe', requireUser, express.json(), wrap(async (req, res) => {
+  await pool.query('DELETE FROM push_subscription WHERE endpoint = $1 AND person_id = $2', [clean(req.body.endpoint, 1000), req.user.id]);
+  res.json({ ok: true });
+}));
+app.post('/api/push/test', requireUser, wrap(async (req, res) => {
+  res.json(await push.sendToPeople([req.user.id], { title: 'Office Packages', body: 'Notifications are working on this device.', url: '/#/', tag: 'test' }));
+}));
+
+// Packages that still need a tracking number (for the admins' to-do).
+app.get('/api/needs-tracking', requireUser, wrap(async (req, res) => {
+  const r = await pool.query(`${LIST_SQL} WHERE pk.status = 'expected' AND pk.tracking IS NULL AND pk.vendor ILIKE 'amazon%' ORDER BY pk.expected_date NULLS LAST, pk.id`, [todayET()]);
+  res.json(r.rows);
 }));
 
 // "amazon:112-…" (vendor + order, no shipment part) = an order confirmation.
@@ -704,7 +758,10 @@ async function digestTick() {
 // ---------- static + errors ----------
 app.get('/healthz', wrap(async (req, res) => { await pool.query('SELECT 1'); res.json({ ok: true }); }));
 app.use(express.static(path.join(__dirname, 'public'), {
-  setHeaders: (res, file) => { if (file.endsWith('.html')) res.set('Cache-Control', 'no-cache'); },
+  setHeaders: (res, file) => {
+    if (file.endsWith('.html') || file.endsWith('sw.js') || file.endsWith('.webmanifest')) res.set('Cache-Control', 'no-cache');
+    if (file.endsWith('.webmanifest')) res.set('Content-Type', 'application/manifest+json');
+  },
 }));
 app.use('/api', (req, res) => res.status(404).json({ error: 'Not found.' }));
 

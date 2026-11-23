@@ -119,7 +119,7 @@
 
   function renderWho() {
     $who.innerHTML = me
-      ? `${esc(me.name)} ${me.is_admin && !me.must_change_pin ? '<a href="#/admin">Admin</a>' : ''} <a href="#/pin">PIN</a> <button id="logout">Sign out</button>`
+      ? `<span class="me">${esc(me.name)}</span> ${me.is_admin && !me.must_change_pin ? '<a href="#/admin">Admin</a> <a href="#/notify">Alerts</a>' : ''} <a href="#/pin">PIN</a> <button id="logout">Sign out</button>`
       : '';
     const b = document.getElementById('logout');
     if (b) b.onclick = async () => { await api('/logout', { method: 'POST' }).catch(() => {}); me = null; location.hash = '#/login'; };
@@ -140,6 +140,9 @@
     try {
       if (h === '/login') return await viewLogin();
       if (h === '/pin') return viewPin();
+      if (h === '/notify') return await viewNotify();
+      if (h === '/scan') return await viewScanReceive();
+      if ((m = /^\/p\/(\d+)\/tracking$/.exec(h))) return await viewAddTracking(Number(m[1]));
       if (h === '/' || h.startsWith('/list/')) return await viewList(h.split('/')[2] || 'expected');
       if ((m = /^\/p\/(\d+)$/.exec(h))) return await viewPackage(Number(m[1]));
       if ((m = /^\/p\/(\d+)\/(arrive|move|collect|edit)$/.exec(h))) return await ({ arrive: viewArrive, move: viewArrive, collect: viewCollect, edit: viewEdit })[m[2]](Number(m[1]), m[2]);
@@ -197,6 +200,228 @@
     };
   }
 
+  // ---------- barcode scanner ----------
+  // Turns whatever a label barcode decodes to into a tracking number, when it recognises one.
+  function trackingFromBarcode(raw) {
+    const s = String(raw || '').toUpperCase().replace(/[^0-9A-Z]/g, '');
+    let m;
+    if ((m = /TBA\d{9,15}/.exec(s))) return m[0];                       // Amazon
+    if ((m = /1Z[0-9A-Z]{16}/.exec(s))) return m[0];                    // UPS
+    if ((m = /^420\d{5}(?:\d{4})?(9[1-5]\d{18,24})$/.exec(s))) return m[1]; // USPS with ZIP prefix
+    if (/^9[1-5]\d{18,24}$/.test(s)) return s;                          // USPS
+    if (/^[A-Z]{2}\d{9}US$/.test(s)) return s;                          // USPS international
+    if (/^\d{34}$/.test(s)) return s.slice(-12);                        // FedEx 34-digit label barcode
+    if (/^(\d{12}|\d{15}|\d{20}|\d{22})$/.test(s)) return s;            // FedEx
+    return null;
+  }
+
+  let zxingLoading = null;
+  function loadZxing() {
+    if (window.ZXing) return Promise.resolve();
+    if (!zxingLoading) {
+      zxingLoading = new Promise((res, rej) => {
+        const sc = document.createElement('script');
+        sc.src = '/vendor/zxing-0.21.3.min.js'; sc.onload = res; sc.onerror = () => rej(new Error('Scanner failed to load.'));
+        document.head.appendChild(sc);
+      });
+    }
+    return zxingLoading;
+  }
+
+  // Opens the camera full-screen and resolves with a tracking number (or null if cancelled).
+  function scanBarcode() {
+    return new Promise((resolve) => {
+      const ov = document.createElement('div');
+      ov.className = 'scanner';
+      ov.innerHTML = `<video playsinline muted></video><div class="aim"></div>
+        <div class="scan-ui"><p id="scanmsg">Point the camera at the barcode on the label</p>
+        <div id="scanfound"></div><button class="btn block" id="scancancel">Cancel</button></div>`;
+      document.body.appendChild(ov);
+      const video = ov.querySelector('video');
+      const msg = ov.querySelector('#scanmsg');
+      let done = false, stream = null, timer = null, lastOther = null;
+      function finish(val) {
+        if (done) return; done = true;
+        clearInterval(timer);
+        if (stream) stream.getTracks().forEach((t) => t.stop());
+        ov.remove(); resolve(val);
+      }
+      function seen(raw) {
+        const t = trackingFromBarcode(raw);
+        if (t) { if (navigator.vibrate) navigator.vibrate(80); finish(t); return; }
+        // A barcode we don't recognise as tracking (sort code etc.): offer it, keep scanning.
+        const v = String(raw).trim();
+        if (v && v !== lastOther && v.length >= 8 && v.length <= 40) {
+          lastOther = v;
+          ov.querySelector('#scanfound').innerHTML = `<p class="small">Read <code>${esc(v)}</code> — not a tracking number I recognise.</p>
+            <button class="btn block" id="useit">Use it anyway</button>`;
+          ov.querySelector('#useit').onclick = () => finish(v.replace(/\s+/g, '').toUpperCase());
+        }
+      }
+      ov.querySelector('#scancancel').onclick = () => finish(null);
+      (async () => {
+        try {
+          stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false });
+          video.srcObject = stream;
+          await video.play().catch(() => {});
+          let detect;
+          if ('BarcodeDetector' in window) {
+            // Native (Android Chrome, some desktops): fast, reads straight from the video.
+            const det = new window.BarcodeDetector({ formats: ['code_128', 'code_39', 'qr_code', 'data_matrix', 'pdf417', 'itf'] });
+            detect = async () => (await det.detect(video)).map((b) => b.rawValue);
+          } else {
+            // ZXing (iPhone, Windows Firefox…): decode a downscaled copy of each frame — full-size
+            // frames are far too slow to decode continuously.
+            await loadZxing();
+            const Z = window.ZXing;
+            const hints = new Map();
+            hints.set(Z.DecodeHintType.POSSIBLE_FORMATS, [Z.BarcodeFormat.CODE_128, Z.BarcodeFormat.CODE_39, Z.BarcodeFormat.ITF,
+              Z.BarcodeFormat.QR_CODE, Z.BarcodeFormat.DATA_MATRIX, Z.BarcodeFormat.PDF_417]);
+            const mf = new Z.MultiFormatReader(); mf.setHints(hints);
+            const canvas = document.createElement('canvas');
+            const ctx2d = canvas.getContext('2d', { willReadFrequently: true });
+            detect = async () => {
+              const vw = video.videoWidth, vh = video.videoHeight;
+              if (!vw || !vh) return [];
+              const scale = Math.min(1, 960 / vw);
+              canvas.width = Math.round(vw * scale); canvas.height = Math.round(vh * scale);
+              ctx2d.drawImage(video, 0, 0, canvas.width, canvas.height);
+              try {
+                const bmp = new Z.BinaryBitmap(new Z.HybridBinarizer(new Z.HTMLCanvasElementLuminanceSource(canvas)));
+                return [mf.decodeWithState(bmp).getText()];
+              } catch { return []; } finally { mf.reset(); }
+            };
+          }
+          let busy = false;
+          timer = setInterval(async () => {
+            if (done || busy || video.readyState < 2) return;
+            busy = true;
+            try { (await detect()).forEach(seen); } catch { /* frame not ready */ } finally { busy = false; }
+          }, 200);
+        } catch (e) {
+          msg.textContent = /Permission|NotAllowed/i.test(e.name + e.message)
+            ? 'Camera access was blocked. Allow the camera for this site in your browser settings, or type the number instead.'
+            : `Can't open the camera here (${e.message}). Type the number instead.`;
+        }
+      })();
+    });
+  }
+
+  // Receiving: scan a label, find the package it belongs to.
+  let pendingTracking = null; // carried into the arrival / walk-in screens
+  async function viewScanReceive() {
+    $app.innerHTML = '<p class="muted pad">Opening the camera…</p>';
+    const code = await scanBarcode();
+    if (!code) { location.hash = '#/list/expected'; return; }
+    const hits = (await api(`/packages?status=all&q=${encodeURIComponent(code)}`))
+      .filter((p) => (p.tracking || '').replace(/\s+/g, '').toUpperCase() === code);
+    const open = hits.find((p) => p.status === 'expected' || p.status === 'missing');
+    if (open) { pendingTracking = code; location.hash = `#/p/${open.id}/arrive`; return; }
+    if (hits.length) {
+      const p = hits[0];
+      $app.innerHTML = `<h1>Already logged</h1><div class="card"><p><strong>${esc(p.description)}</strong></p>
+        <p>${p.status === 'arrived' ? `In the office since ${esc(fmtDT(p.arrived_at))} — 📍 ${esc(p.location)}` : esc(p.status)}</p></div>
+        <div class="actions"><a class="btn primary block" href="#/p/${p.id}">Open it</a><a class="btn block" href="#/scan">Scan another</a></div>`;
+      return;
+    }
+    // No package has this number yet. Amazon numbers never come by email, so offer the
+    // expected packages without a tracking number to choose from.
+    const candidates = (await api('/packages?status=expected')).filter((p) => !p.tracking);
+    $app.innerHTML = `<p><a href="#/list/expected">← Back</a></p><h1>Which package is this?</h1>
+      <p class="muted">Scanned <code>${esc(code)}</code>. No package has this number yet${candidates.length ? ' — pick the one it belongs to' : ''}.</p>
+      <div class="list">${candidates.map((p) => `<button class="item pick" data-id="${p.id}" style="text-align:left;width:100%;font:inherit">
+        <div class="thumb">📦</div><div class="body"><div class="title">${esc(p.description)}</div>
+        <div class="meta">${esc([p.vendor, p.expected_date ? 'Due ' + fmtDay(p.expected_date) : '', p.recipient_name ? 'for ' + p.recipient_name : ''].filter(Boolean).join(' · '))}</div></div></button>`).join('')}</div>
+      <div class="actions"><button class="btn dark block" id="notlisted">It's not on the list</button><a class="btn block" href="#/scan">Scan again</a></div>`;
+    $app.querySelectorAll('.pick').forEach((b) => b.onclick = () => { pendingTracking = code; location.hash = `#/p/${b.dataset.id}/arrive`; });
+    document.getElementById('notlisted').onclick = () => { pendingTracking = code; location.hash = '#/walkin'; };
+  }
+
+  // ---------- add a tracking number (from a push notification) ----------
+  async function viewAddTracking(id) {
+    const p = await api(`/packages/${id}`);
+    const tu = trackUrl(p);
+    $app.innerHTML = `<p><a href="#/p/${id}">← Package</a></p>
+      <h1>Tracking number for: ${esc(p.description)}</h1>
+      ${p.tracking ? `<div class="banner amber">Already has one: <strong>${esc(p.tracking)}</strong>. Saving replaces it.</div>` : ''}
+      <ol class="steps"><li>Open Amazon's tracking page${/amazon/i.test(p.vendor || '') ? ' (signed in to Amazon)' : ''}.</li>
+        <li>Copy the <strong>Tracking ID</strong> — it starts with <strong>TBA</strong> (or 1Z for UPS).</li><li>Paste it below and save.</li></ol>
+      ${tu ? `<a class="btn block" href="${esc(tu)}" target="_blank" rel="noopener">Open the tracking page ↗</a>` : ''}
+      <label class="f">Tracking number<input id="trk" autocomplete="off" autocapitalize="characters" value="${esc(p.tracking || '')}" placeholder="TBA…"></label>
+      <p class="err" id="err"></p>
+      <button class="btn primary block" id="save">Save</button>
+      <div id="next"></div>`;
+    const input = document.getElementById('trk');
+    input.addEventListener('paste', () => setTimeout(() => { input.value = input.value.replace(/\s+/g, '').toUpperCase(); }, 0));
+    document.getElementById('save').onclick = async () => {
+      const v = input.value.replace(/\s+/g, '').toUpperCase();
+      if (!v) { document.getElementById('err').textContent = 'Paste the tracking number first.'; return; }
+      try {
+        await api(`/packages/${id}`, { method: 'PATCH', json: { tracking: v } });
+        toast('Tracking number saved');
+        const rest = (await api('/needs-tracking')).filter((x) => x.id !== id);
+        if (rest.length) location.hash = `#/p/${rest[0].id}/tracking`; else location.hash = `#/p/${id}`;
+      } catch (e) { document.getElementById('err').textContent = e.message; }
+    };
+    const rest = (await api('/needs-tracking').catch(() => [])).filter((x) => x.id !== id);
+    if (rest.length) document.getElementById('next').innerHTML = `<p class="small muted" style="margin-top:12px">${rest.length} more Amazon package${rest.length > 1 ? 's' : ''} need a tracking number — you'll go to the next one after saving.</p>`;
+  }
+
+  // ---------- notifications on this device ----------
+  function urlB64ToUint8Array(b64) {
+    const pad = '='.repeat((4 - (b64.length % 4)) % 4);
+    const raw = atob((b64 + pad).replace(/-/g, '+').replace(/_/g, '/'));
+    return Uint8Array.from([...raw].map((c) => c.charCodeAt(0)));
+  }
+  async function viewNotify() {
+    const isIOS = /iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+    const standalone = window.matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
+    const supported = 'serviceWorker' in navigator && 'PushManager' in window && 'Notification' in window;
+    const info = await api('/push/key');
+    let sub = null;
+    if (supported) {
+      const reg = await navigator.serviceWorker.register('/sw.js');
+      sub = await reg.pushManager.getSubscription();
+    }
+    let body;
+    if (isIOS && !standalone) {
+      body = `<div class="card"><h2 style="margin-top:0">iPhone: one-time setup</h2>
+        <ol class="steps"><li>In Safari, tap the <strong>Share</strong> button (square with an arrow).</li>
+        <li>Choose <strong>Add to Home Screen</strong>, then <strong>Add</strong>.</li>
+        <li>Open <strong>Packages</strong> from your Home Screen, sign in, and come back to this page (tap <strong>Alerts</strong> at the top).</li></ol>
+        <p class="small muted">Apple only allows notifications for sites opened from the Home Screen.</p></div>`;
+    } else if (!supported) {
+      body = '<div class="banner amber">This browser can’t receive notifications. Use Chrome or Edge, or Safari on an iPhone added to the Home Screen.</div>';
+    } else if (!info.enabled) {
+      body = '<div class="banner amber">Notifications aren’t set up on the server yet.</div>';
+    } else if (Notification.permission === 'denied') {
+      body = '<div class="banner red">Notifications are blocked for this site. Allow them in your browser’s site settings, then reload this page.</div>';
+    } else {
+      body = `<div class="card"><p style="margin-top:0"><strong>${sub ? '✓ Notifications are ON for this device.' : 'Notifications are off on this device.'}</strong></p>
+        <p class="small muted">You're signed up on ${info.my_devices} device${info.my_devices === 1 ? '' : 's'} in total.</p></div>
+        <div class="actions">${sub ? '<button class="btn block" id="test">Send a test notification</button><button class="btn block danger" id="off">Turn off on this device</button>'
+          : '<button class="btn primary block" id="on">Turn on notifications</button>'}</div>`;
+    }
+    $app.innerHTML = `<p><a href="#/">← Back</a></p><h1>Notifications</h1>
+      <p class="muted">${me.is_admin ? 'You’ll get a notification when the email scan finds an Amazon package that needs its tracking number. Tap it to add the number.' : 'Notifications for your packages.'}</p>${body}`;
+    const on = document.getElementById('on');
+    if (on) on.onclick = async () => {
+      try {
+        const perm = await Notification.requestPermission();
+        if (perm !== 'granted') { toast('Notifications were not allowed'); return viewNotify(); }
+        const reg = await navigator.serviceWorker.ready;
+        const s = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: urlB64ToUint8Array(info.key) });
+        await api('/push/subscribe', { method: 'POST', json: { subscription: s.toJSON() } });
+        await api('/push/test', { method: 'POST' });
+        toast('Turned on — a test notification is on its way'); viewNotify();
+      } catch (e) { toast(e.message); }
+    };
+    const test = document.getElementById('test');
+    if (test) test.onclick = async () => { const r = await api('/push/test', { method: 'POST' }); toast(r.sent ? 'Sent — check your notifications' : 'Not sent'); };
+    const off = document.getElementById('off');
+    if (off) off.onclick = async () => { await api('/push/unsubscribe', { method: 'POST', json: { endpoint: sub.endpoint } }); await sub.unsubscribe(); toast('Turned off'); viewNotify(); };
+  }
+
   // ---------- my PIN ----------
   function viewPin() {
     const forced = !!me.must_change_pin;
@@ -238,7 +463,8 @@
       </nav>
       ${status === 'expected' && counts.attention ? `<div class="banner red">${counts.attention} package${counts.attention > 1 ? 's' : ''} need attention — the carrier says delivered or it's overdue, but nobody has logged it here.</div>` : ''}
       <input class="search" id="q" type="search" placeholder="${status === 'all' ? 'Search everything: tracking, order #, item, name…' : 'Filter by item, name or tracking #…'}" autocomplete="off">
-      ${status === 'expected' ? '<div class="row" style="margin-bottom:10px"><a class="btn dark" href="#/walkin">Arrived but not on the list</a></div>' : ''}
+      ${status === 'expected' ? `<div class="row" style="margin-bottom:10px"><a class="btn primary" href="#/scan">📷 Scan a label</a><a class="btn dark" href="#/walkin">Not on the list</a></div>
+        <div id="needtrk"></div>` : ''}
       <div class="list" id="list"></div>
       <a class="btn primary fab" href="#/add">＋ Add package</a>`;
     const listEl = document.getElementById('list');
@@ -269,6 +495,12 @@
     }
     let t; qEl.oninput = () => { clearTimeout(t); t = setTimeout(() => load().catch((e) => toast(e.message)), 250); };
     await load();
+    if (status === 'expected' && me.is_admin) {
+      const need = await api('/needs-tracking').catch(() => []);
+      const el = document.getElementById('needtrk');
+      if (el && need.length) el.innerHTML = `<a class="banner amber" style="display:block;text-decoration:none" href="#/p/${need[0].id}/tracking">
+        ${need.length} Amazon package${need.length > 1 ? 's' : ''} need${need.length > 1 ? '' : 's'} a tracking number — tap to add from Amazon.</a>`;
+    }
   }
 
   // ---------- package detail ----------
@@ -356,6 +588,14 @@
       <datalist id="locs">${locs.map((l) => `<option value="${esc(l)}">`).join('')}</datalist>
       ${locs.length ? `<div class="chips">${locs.slice(0, 8).map((l) => `<button type="button" class="chip" data-loc="${esc(l)}">${esc(l)}</button>`).join('')}</div>` : ''}`;
   }
+  function wireScanButton(btnId, inputId) {
+    const b = document.getElementById(btnId);
+    if (!b) return;
+    b.onclick = async () => {
+      const code = await scanBarcode();
+      if (code) { document.getElementById(inputId).value = code; toast('Scanned ' + code); }
+    };
+  }
   function wireChips() {
     $app.querySelectorAll('[data-loc]').forEach((c) => c.onclick = () => { document.getElementById('loc').value = c.dataset.loc; });
   }
@@ -368,11 +608,14 @@
       <p class="muted">${moving ? `Currently: ${esc(p.location)}` : 'Take a photo showing the package where you put it, so anyone can find it.'}</p>
       <div id="pic"></div>
       ${!moving && !p.tracking ? `<label class="f">Tracking number on the label (Amazon ones start with TBA)
-        <input id="trk" autocomplete="off" autocapitalize="characters" placeholder="e.g. TBA123456789000"></label>` : ''}
+        <span class="inrow"><input id="trk" autocomplete="off" autocapitalize="characters" placeholder="e.g. TBA123456789000" value="${esc(pendingTracking || '')}">
+        <button type="button" class="btn" id="scanbtn" aria-label="Scan the barcode">📷 Scan</button></span></label>` : ''}
       ${await locationField()}
       <p class="err" id="err"></p>
       <button class="btn primary block" id="save">${moving ? 'Save new spot' : 'Save — it is here'}</button>`;
     wireChips();
+    pendingTracking = null;
+    wireScanButton('scanbtn', 'trk');
     const getBlob = photoPicker(document.getElementById('pic'), moving ? 'Photo of the new spot (optional)' : 'Photo of where you put it');
     document.getElementById('save').onclick = async (ev) => {
       const btn = ev.currentTarget; const err = document.getElementById('err');
@@ -401,10 +644,14 @@
       <label class="f">What is it / who is it from?<input id="desc" placeholder="e.g. Small box from Home Depot"></label>
       <label class="f">Name on the label<input id="label_name"></label>
       <label class="f">For<select id="rcp"><option value="">Not sure</option>${people.filter((x) => x.can_collect).map((x) => `<option value="${x.id}">${esc(x.name)}</option>`).join('')}</select></label>
-      <label class="f">Tracking number (if you can read it)<input id="trk" autocomplete="off"></label>
+      <label class="f">Tracking number on the label
+        <span class="inrow"><input id="trk" autocomplete="off" autocapitalize="characters" value="${esc(pendingTracking || '')}">
+        <button type="button" class="btn" id="scanbtn" aria-label="Scan the barcode">📷 Scan</button></span></label>
       <div id="spot" style="margin-top:12px"></div>${await locationField()}
       <p class="err" id="err"></p><button class="btn primary block" id="save">Save — it is here</button>`;
     wireChips();
+    pendingTracking = null;
+    wireScanButton('scanbtn', 'trk');
     const getLabel = photoPicker(document.getElementById('label'), 'Photo of the label');
     const getSpot = photoPicker(document.getElementById('spot'), 'Photo of where you put it');
     document.getElementById('save').onclick = async (ev) => {

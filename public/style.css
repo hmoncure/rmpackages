@@ -11,6 +11,9 @@ a { color: var(--accent-ink); }
 .brand { color: #fff; text-decoration: none; font-weight: 700; display: flex; align-items: center; gap: 8px; }
 .logo { width: 22px; height: 22px; border-radius: 6px; background: var(--accent); display: inline-block; }
 .who { font-size: 14px; display: flex; gap: 10px; align-items: center; }
+.brand, .who { white-space: nowrap; }
+@media (max-width: 480px) { .brand .full { display: none; } .who { gap: 8px; font-size: 13px; } }
+@media (max-width: 360px) { .who .me { display: none; } .top { padding-left: 12px; padding-right: 12px; } }
 .who a, .who button { color: #cfe; background: none; border: 0; font: inherit; padding: 0; cursor: pointer; text-decoration: underline; }
 main { max-width: 760px; margin: 0 auto; padding: 12px 16px 96px; }
 .pad { padding: 16px; }
@@ -72,6 +75,16 @@ h2 { font-size: 17px; margin: 20px 0 8px; }
 label.f { display: block; margin: 10px 0; font-size: 14px; color: var(--muted); }
 label.f input, label.f select, label.f textarea { display: block; width: 100%; margin-top: 4px; padding: 11px 12px; border: 1px solid var(--line);
   border-radius: 10px; font: inherit; color: var(--ink); background: #fff; }
+.inrow { display: flex; gap: 6px; margin-top: 4px; }
+.inrow input { margin-top: 0 !important; flex: 1; min-width: 0; }
+.inrow .btn { flex: 0 0 auto; min-height: 44px; padding: 8px 12px; }
+ol.steps { padding-left: 20px; } ol.steps li { margin: 4px 0; }
+.scanner { position: fixed; inset: 0; z-index: 40; background: #000; display: flex; flex-direction: column; }
+.scanner video { flex: 1; width: 100%; min-height: 0; object-fit: cover; }
+.scanner .aim { position: absolute; left: 8%; right: 8%; top: 32%; height: 22%; border: 3px solid var(--accent); border-radius: 12px;
+  box-shadow: 0 0 0 9999px rgba(0,0,0,.35); pointer-events: none; }
+.scanner .scan-ui { background: var(--card); padding: 12px 16px max(16px, env(safe-area-inset-bottom)); }
+.scanner .scan-ui p { margin: 0 0 8px; }
 label.check { display: flex; gap: 8px; align-items: center; margin: 8px 0; }
 .err { color: var(--red); font-weight: 600; margin: 8px 0; }
 
