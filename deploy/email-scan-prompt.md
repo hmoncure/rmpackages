@@ -13,6 +13,7 @@ If this fails with a network error, stop and report that the tracker could not b
 Run these searches with afterDateTime = the window start, paging through every page:
 - sender `shipment-tracking@amazon.com` (Shipped / Out for delivery / Delivered)
 - sender `order-update@amazon.com` (Delivery update / delayed)
+- sender `auto-confirm@amazon.com` (Ordered … — 30-day window)
 - sender `ebay@ebay.com`
 - query `"tracking number"`
 - query `"out for delivery"`
@@ -25,7 +26,7 @@ Read the email (read_resource; if it is too large to return inline, parse the sa
 - Amazon: the shipment card shows "<Name> - ALEXANDRIA, VA" (Amazon never shows the street). That is the office.
 - Others: the ship-to / delivery address contains 726 N Washington St or Alexandria, VA 22314.
 - Bluefields Bay Villas' own email signature/footer contains this address — that does NOT count. Nor does a sender's own footer (e.g. ASTA in Alexandria).
-- Amazon "Ordered …" emails from auto-confirm@amazon.com: SKIP — wait for the "Shipped" email, which carries the shipment.
+- Amazon "Ordered …" emails from auto-confirm@amazon.com: INCLUDE them, as ORDER-level items: source_ref "amazon:<order #>", carrier_status "ordered", expected_date = last day of the range. Seller-shipped items often never get a "Shipped" email. The tracker merges the order with its first shipment. Search these over 30 days, not 5.
 - Non-Amazon vendors that only send an order confirmation (ship-to = office, estimated delivery given): include with carrier_status "ordered".
 - Carrier notifications (UPS/FedEx/USPS "delivered", "out for delivery") usually show no address. Send one ONLY when its tracking number is already in the tracker (step 1 list) or it clearly belongs to a vendor email in this scan that shipped to the office — then it is an update. Otherwise do not send it; list it under "unsure" in the report with tracking number and shipper.
 - Amazon "Delivered" emails count (same shipment card).

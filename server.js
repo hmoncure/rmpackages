@@ -530,6 +530,9 @@ app.post('/api/import', requireService, express.json({ limit: '1mb' }), wrap(asy
   res.json({ summary, results });
 }));
 
+// "amazon:112-…" (vendor + order, no shipment part) = an order confirmation.
+const orderLevelRef = (ref, order) => new RegExp(`^[a-z0-9-]+:${order.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'i').test(ref);
+
 async function importOne(raw, service) {
   const ref = clean(raw.source_ref, 200);
   if (!ref) throw new HttpError(400, 'source_ref is required.');
@@ -558,6 +561,24 @@ async function importOne(raw, service) {
            AND ((tracking IS NOT NULL AND lower(tracking) = lower($1)) OR (tracking IS NULL AND order_number IS NOT NULL AND order_number = $2))
          ORDER BY id LIMIT 2 FOR UPDATE`, [f.tracking || '', f.order_number || '']);
       if (m.rows.length === 1) { cur = m.rows[0]; attached = true; }
+    }
+    // An ORDER-level entry ("amazon:<order#>", from an order confirmation) is upgraded by the
+    // first SHIPMENT-level item for that order, so the order and its shipment are one package.
+    // Later shipments of the same order then create packages of their own.
+    if (!cur && f.order_number) {
+      const orderRefs = [`amazon:${f.order_number}`, `${(f.vendor || '').toLowerCase()}:${f.order_number}`].filter((r) => r !== ref);
+      if (orderRefs.length) {
+        const m = await c.query(
+          `SELECT * FROM package WHERE source_ref = ANY($1) AND status IN ('expected','arrived') ORDER BY id LIMIT 1 FOR UPDATE`, [orderRefs]);
+        if (m.rows[0]) { cur = m.rows[0]; attached = true; }
+      }
+    }
+
+    // An order confirmation for an order we already track (its shipment upgraded the order-level
+    // entry, or it was cancelled/collected) adds nothing — never recreate it.
+    if (!cur && f.order_number && orderLevelRef(ref, f.order_number)) {
+      const known = await c.query('SELECT id FROM package WHERE order_number = $1 ORDER BY id LIMIT 1', [f.order_number]);
+      if (known.rows[0]) return { source_ref: ref, result: 'unchanged', id: known.rows[0].id, reason: 'order already tracked' };
     }
 
     if (!cur) {
