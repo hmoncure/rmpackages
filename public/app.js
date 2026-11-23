@@ -22,6 +22,7 @@
     let data = null;
     try { data = await r.json(); } catch { /* empty */ }
     if (r.status === 401 && !path.startsWith('/login')) { me = null; location.hash = '#/login'; throw new Error('Please sign in.'); }
+    if (r.status === 403 && data && data.must_change_pin) { location.hash = '#/pin'; throw new Error(data.error); }
     if (!r.ok) throw new Error((data && data.error) || `Request failed (${r.status})`);
     return data;
   }
@@ -87,7 +88,7 @@
 
   function renderWho() {
     $who.innerHTML = me
-      ? `${esc(me.name)} ${me.is_admin ? '<a href="#/admin">Admin</a>' : ''} <button id="logout">Sign out</button>`
+      ? `${esc(me.name)} ${me.is_admin && !me.must_change_pin ? '<a href="#/admin">Admin</a>' : ''} <a href="#/pin">PIN</a> <button id="logout">Sign out</button>`
       : '';
     const b = document.getElementById('logout');
     if (b) b.onclick = async () => { await api('/logout', { method: 'POST' }).catch(() => {}); me = null; location.hash = '#/login'; };
@@ -100,12 +101,14 @@
       try { me = await api('/me'); } catch { me = null; }
       if (!me) { location.hash = '#/login'; return; }
     }
-    if (me && !people.length) people = await api('/people').catch(() => []);
+    if (me && me.must_change_pin && h !== '/pin' && h !== '/login') { location.hash = '#/pin'; return; }
+    if (me && !me.must_change_pin && !people.length) people = await api('/people').catch(() => []);
     renderWho();
     window.scrollTo(0, 0);
     let m;
     try {
       if (h === '/login') return await viewLogin();
+      if (h === '/pin') return viewPin();
       if (h === '/' || h.startsWith('/list/')) return await viewList(h.split('/')[2] || 'expected');
       if ((m = /^\/p\/(\d+)$/.exec(h))) return await viewPackage(Number(m[1]));
       if ((m = /^\/p\/(\d+)\/(arrive|move|collect|edit)$/.exec(h))) return await ({ arrive: viewArrive, move: viewArrive, collect: viewCollect, edit: viewEdit })[m[2]](Number(m[1]), m[2]);
@@ -142,7 +145,9 @@
     async function go() {
       try {
         await api('/login', { method: 'POST', json: { person_id: chosen, pin } });
-        me = await api('/me'); people = await api('/people');
+        me = await api('/me');
+        if (me.must_change_pin) { location.hash = '#/pin'; return; }
+        people = await api('/people');
         location.hash = '#/';
       } catch (e) { pin = ''; dots(); document.getElementById('lerr').textContent = e.message; }
     }
@@ -158,6 +163,35 @@
       if (/^\d$/.test(e.key) && pin.length < 8) { pin += e.key; dots(); }
       else if (e.key === 'Backspace') { pin = pin.slice(0, -1); dots(); }
       else if (e.key === 'Enter' && pin.length >= 4) go();
+    };
+  }
+
+  // ---------- my PIN ----------
+  function viewPin() {
+    const forced = !!me.must_change_pin;
+    const pinInput = (id, label) => `<label class="f">${label}<input id="${id}" type="password" inputmode="numeric" pattern="\\d*" maxlength="8" autocomplete="${id === 'cur' ? 'current-password' : 'new-password'}"></label>`;
+    $app.innerHTML = `${forced ? '' : '<p><a href="#/">← Back</a></p>'}
+      <h1>${forced ? `Welcome, ${esc(me.name)} — choose your own PIN` : 'Change my PIN'}</h1>
+      <p class="muted">${forced ? 'You signed in with a starter PIN. Pick a new one that only you know — it records your name on every package you log or hand out.' : 'Your PIN is how the tracker knows it was you.'}</p>
+      <form id="pf" class="card">
+        ${pinInput('cur', forced ? 'Starter PIN (the one in your email)' : 'Current PIN')}
+        ${pinInput('new1', 'New PIN (4 to 8 digits)')}
+        ${pinInput('new2', 'New PIN again')}
+        <p class="small muted">Avoid repeated digits and runs like 1234.</p>
+        <p class="err" id="err"></p>
+        <button class="btn primary block">Save my PIN</button>
+      </form>`;
+    document.getElementById('pf').onsubmit = async (ev) => {
+      ev.preventDefault();
+      const err = document.getElementById('err'); err.textContent = '';
+      const cur = document.getElementById('cur').value, a = document.getElementById('new1').value, b = document.getElementById('new2').value;
+      if (!/^\d{4,8}$/.test(a)) { err.textContent = 'Your new PIN must be 4 to 8 digits.'; return; }
+      if (a !== b) { err.textContent = 'The two new PINs don’t match.'; return; }
+      try {
+        await api('/me/pin', { method: 'POST', json: { current: cur, pin: a } });
+        me = await api('/me'); people = await api('/people').catch(() => []);
+        toast('PIN saved'); location.hash = '#/';
+      } catch (e) { err.textContent = e.message; }
     };
   }
 
@@ -436,7 +470,7 @@
         <label class="f">Name<input name="name" required value="${esc(x ? x.name : '')}"></label>
         <label class="f">Email (for alerts)<input name="email" type="email" value="${esc(x ? x.email || '' : '')}"></label>
         <label class="f">Other names on labels (comma separated)<input name="aliases" value="${esc(x && x.aliases ? x.aliases.join(', ') : '')}"></label>
-        <label class="f">${x && x.has_pin ? 'New PIN (leave blank to keep)' : 'PIN (4–8 digits; leave blank if they never sign in)'}<input name="pin" inputmode="numeric" pattern="\\d{4,8}" autocomplete="new-password"></label>
+        <label class="f">${x && x.has_pin ? 'New starter PIN (leave blank to keep; they choose their own at next sign-in)' : 'Starter PIN (4–8 digits; they choose their own at first sign-in; blank = never signs in)'}<input name="pin" inputmode="numeric" pattern="\\d{4,8}" autocomplete="new-password"></label>
         <label class="check"><input type="checkbox" name="can_collect" ${!x || x.can_collect ? 'checked' : ''}> Can take packages out of the office</label>
         <label class="check"><input type="checkbox" name="is_admin" ${x && x.is_admin ? 'checked' : ''}> Admin</label>
         ${x ? `<label class="check"><input type="checkbox" name="active" ${x.active ? 'checked' : ''}> Active</label>

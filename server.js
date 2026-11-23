@@ -69,7 +69,7 @@ async function loadSession(req, res, next) {
     const tok = parseCookies(req)[COOKIE];
     if (tok) {
       const r = await pool.query(
-        `SELECT p.id, p.name, p.is_admin, p.can_collect FROM session s JOIN person p ON p.id = s.person_id
+        `SELECT p.id, p.name, p.is_admin, p.can_collect, p.must_change_pin FROM session s JOIN person p ON p.id = s.person_id
           WHERE s.token_hash = $1 AND s.expires_at > now() AND p.active`, [sha256(tok)]);
       if (r.rows[0]) req.user = r.rows[0];
     }
@@ -78,8 +78,25 @@ async function loadSession(req, res, next) {
 }
 app.use('/api', loadSession);
 
-const requireUser = (req, res, next) => (req.user ? next() : res.status(401).json({ error: 'Please sign in.' }));
-const requireAdmin = (req, res, next) => (req.user && req.user.is_admin ? next() : res.status(403).json({ error: 'Admins only.' }));
+// Signed in, PIN may still be the starter one (only /me, /me/pin, /logout use this).
+const requireSignedIn = (req, res, next) => (req.user ? next() : res.status(401).json({ error: 'Please sign in.' }));
+// Everything else: a starter PIN must be replaced before anything can be done.
+const requireUser = (req, res, next) => {
+  if (!req.user) return res.status(401).json({ error: 'Please sign in.' });
+  if (req.user.must_change_pin) return res.status(403).json({ error: 'Choose your own PIN first.', must_change_pin: true });
+  next();
+};
+const requireAdmin = (req, res, next) => requireUser(req, res, () =>
+  (req.user.is_admin ? next() : res.status(403).json({ error: 'Admins only.' })));
+
+// Reject PINs anyone would guess: one repeated digit, or a straight run (1234, 9876…).
+function weakPin(pin) {
+  if (/^(\d)\1+$/.test(pin)) return true;
+  const d = pin.split('').map(Number);
+  const up = d.every((x, i) => i === 0 || x === (d[i - 1] + 1) % 10);
+  const down = d.every((x, i) => i === 0 || x === (d[i - 1] + 9) % 10);
+  return up || down;
+}
 
 async function requireService(req, res, next) {
   try {
@@ -131,7 +148,24 @@ app.post('/api/logout', wrap(async (req, res) => {
   res.json({ ok: true });
 }));
 
-app.get('/api/me', requireUser, (req, res) => res.json(req.user));
+app.get('/api/me', requireSignedIn, (req, res) => res.json(req.user));
+
+// Change my own PIN. Needs the current one, so a borrowed signed-in phone can't take over an account.
+app.post('/api/me/pin', requireSignedIn, express.json(), wrap(async (req, res) => {
+  const current = String(req.body.current || '');
+  const next = String(req.body.pin || '');
+  if (!/^\d{4,8}$/.test(next)) throw new HttpError(400, 'Your new PIN must be 4 to 8 digits.');
+  if (weakPin(next)) throw new HttpError(400, 'That PIN is too easy to guess. Avoid repeated digits and runs like 1234.');
+  const p = (await pool.query('SELECT pin_hash FROM person WHERE id = $1', [req.user.id])).rows[0];
+  if (!p || !p.pin_hash || !(await bcrypt.compare(current, p.pin_hash))) throw new HttpError(400, 'Your current PIN is not right.');
+  if (current === next) throw new HttpError(400, 'Choose a PIN different from the one you were given.');
+  await pool.query('UPDATE person SET pin_hash = $2, must_change_pin = false, failed_pins = 0, locked_until = NULL WHERE id = $1',
+    [req.user.id, await bcrypt.hash(next, 10)]);
+  // Sign out every OTHER session of this person; keep this one.
+  const tok = parseCookies(req)[COOKIE];
+  await pool.query('DELETE FROM session WHERE person_id = $1 AND token_hash <> $2', [req.user.id, sha256(tok || '')]);
+  res.json({ ok: true });
+}));
 
 app.get('/api/people', requireUser, wrap(async (req, res) => {
   const r = await pool.query('SELECT id, name, can_collect, is_admin FROM person WHERE active ORDER BY name');
@@ -399,10 +433,13 @@ function readPerson(b) {
   return f;
 }
 
-async function setPin(c, id, pin) {
+// An admin-set PIN is a STARTER PIN: the person must replace it at next sign-in
+// (unless the admin is setting their own).
+async function setPin(c, id, pin, actorId) {
   if (pin === undefined || pin === null || pin === '') return;
   if (!/^\d{4,8}$/.test(String(pin))) throw new HttpError(400, 'PIN must be 4 to 8 digits.');
-  await c.query('UPDATE person SET pin_hash = $2, failed_pins = 0, locked_until = NULL WHERE id = $1', [id, await bcrypt.hash(String(pin), 10)]);
+  await c.query('UPDATE person SET pin_hash = $2, must_change_pin = $3, failed_pins = 0, locked_until = NULL WHERE id = $1',
+    [id, await bcrypt.hash(String(pin), 10), id !== actorId]);
   await c.query('DELETE FROM session WHERE person_id = $1', [id]);
 }
 
@@ -413,7 +450,7 @@ app.post('/api/admin/people', requireAdmin, express.json(), wrap(async (req, res
     const cols = Object.keys(f);
     const r = await c.query(`INSERT INTO person (${cols.join(',')}) VALUES (${cols.map((_, i) => '$' + (i + 1)).join(',')}) RETURNING id`,
       cols.map((k) => f[k])).catch((e) => { if (e.code === '23505') throw new HttpError(409, 'Someone already has that name.'); throw e; });
-    await setPin(c, r.rows[0].id, req.body.pin);
+    await setPin(c, r.rows[0].id, req.body.pin, req.user.id);
     return r.rows[0].id;
   });
   res.status(201).json({ id });
@@ -433,7 +470,7 @@ app.patch('/api/admin/people/:id(\\d+)', requireAdmin, express.json(), wrap(asyn
       await c.query('UPDATE person SET pin_hash = NULL WHERE id = $1', [id]);
       await c.query('DELETE FROM session WHERE person_id = $1', [id]);
     }
-    await setPin(c, id, req.body.pin);
+    await setPin(c, id, req.body.pin, req.user.id);
     if (f.active === false) await c.query('DELETE FROM session WHERE person_id = $1', [id]);
   });
   res.json({ ok: true });
