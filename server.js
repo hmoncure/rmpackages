@@ -333,15 +333,19 @@ app.post('/api/packages/:id(\\d+)/arrive', requireUser, express.json(), wrap(asy
   const id = Number(req.params.id);
   const location = clean(req.body.location, 200);
   const photoId = Number(req.body.photo_id) || null;
+  // The tracking number printed on the label (Amazon's TBA… never appears in its emails).
+  const labelTracking = clean(req.body.tracking, 100) ? clean(req.body.tracking, 100).replace(/\s+/g, '').toUpperCase() : null;
   if (!location) throw new HttpError(400, 'Say where you put it.');
   await tx(async (c) => {
-    const cur = (await c.query('SELECT status FROM package WHERE id = $1 FOR UPDATE', [id])).rows[0];
+    const cur = (await c.query('SELECT status, tracking FROM package WHERE id = $1 FOR UPDATE', [id])).rows[0];
     if (!cur) throw new HttpError(404, 'No such package.');
     if (cur.status !== 'expected' && cur.status !== 'missing') throw new HttpError(409, `This package is already ${cur.status}.`);
     if (!(await photoBelongs(c, photoId, id))) throw new HttpError(400, 'Take a photo of where you put it.');
-    await c.query(`UPDATE package SET status = 'arrived', arrived_at = now(), arrived_by = $2, location = $3, updated_at = now() WHERE id = $1`,
-      [id, req.user.id, location]);
-    await logEvent(c, id, req.user.id, 'arrived', { location, photo_id: photoId, was: cur.status });
+    const setTracking = labelTracking && !cur.tracking ? labelTracking : null;
+    await c.query(`UPDATE package SET status = 'arrived', arrived_at = now(), arrived_by = $2, location = $3,
+                     tracking = coalesce($4, tracking), updated_at = now() WHERE id = $1`,
+      [id, req.user.id, location, setTracking]);
+    await logEvent(c, id, req.user.id, 'arrived', { location, photo_id: photoId, was: cur.status, ...(setTracking ? { tracking: setTracking } : {}) });
   });
   const p = await getPackage(id);
   sendArrivalAlert(p).catch((e) => console.error('arrival alert', e));

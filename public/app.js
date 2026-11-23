@@ -57,6 +57,8 @@
   // Short reference for the list: the end of the tracking number is what you match on a label.
   function shortRef(p) {
     if (p.tracking) { const t = p.tracking.replace(/\s+/g, ''); return `Tracking …${t.slice(-8)}`; }
+    // Amazon order numbers are not printed on the box, so don't show one to match against.
+    if (/amazon/i.test(p.vendor || '')) return '';
     if (p.order_number) return `Order ${p.order_number}`;
     return '';
   }
@@ -235,7 +237,7 @@
         ${tab('all', 'Search')}
       </nav>
       ${status === 'expected' && counts.attention ? `<div class="banner red">${counts.attention} package${counts.attention > 1 ? 's' : ''} need attention — the carrier says delivered or it's overdue, but nobody has logged it here.</div>` : ''}
-      <input class="search" id="q" type="search" placeholder="${status === 'all' ? 'Search everything: tracking, order #, item, name…' : 'Filter…'}" autocomplete="off">
+      <input class="search" id="q" type="search" placeholder="${status === 'all' ? 'Search everything: tracking, order #, item, name…' : 'Filter by item, name or tracking #…'}" autocomplete="off">
       ${status === 'expected' ? '<div class="row" style="margin-bottom:10px"><a class="btn dark" href="#/walkin">Arrived but not on the list</a></div>' : ''}
       <div class="list" id="list"></div>
       <a class="btn primary fab" href="#/add">＋ Add package</a>`;
@@ -323,7 +325,8 @@
           ${kv('Name on label', esc(p.label_name || ''))}
           ${kv('From', esc(p.vendor || ''))}
           ${kv('Carrier', esc(p.carrier || ''))}
-          ${kv('Tracking', p.tracking ? (trackUrl(p) ? `<a href="${esc(trackUrl(p))}" target="_blank" rel="noopener">${esc(p.tracking)}</a>` : esc(p.tracking)) : '')}
+          ${kv('Tracking', p.tracking ? (trackUrl(p) ? `<a href="${esc(trackUrl(p))}" target="_blank" rel="noopener">${esc(p.tracking)}</a>` : esc(p.tracking))
+            : (/amazon/i.test(p.vendor || '') && p.status === 'expected' ? '<span class="muted">Amazon doesn’t email it — added from the label on arrival</span>' : ''))}
           ${kv('Order #', esc(p.order_number || ''))}
           ${kv('Expected', esc(fmtDay(p.expected_date)))}
           ${kv('Carrier status', esc((p.carrier_status || '').replace(/_/g, ' ')))}
@@ -363,7 +366,10 @@
     $app.innerHTML = `<p><a href="#/p/${id}">← Back</a></p>
       <h1>${moving ? 'New spot for' : 'Log arrival:'} ${esc(p.description)}</h1>
       <p class="muted">${moving ? `Currently: ${esc(p.location)}` : 'Take a photo showing the package where you put it, so anyone can find it.'}</p>
-      <div id="pic"></div>${await locationField()}
+      <div id="pic"></div>
+      ${!moving && !p.tracking ? `<label class="f">Tracking number on the label (Amazon ones start with TBA)
+        <input id="trk" autocomplete="off" autocapitalize="characters" placeholder="e.g. TBA123456789000"></label>` : ''}
+      ${await locationField()}
       <p class="err" id="err"></p>
       <button class="btn primary block" id="save">${moving ? 'Save new spot' : 'Save — it is here'}</button>`;
     wireChips();
@@ -379,7 +385,8 @@
       try {
         let photo_id = null;
         if (blob) photo_id = (await api(`/packages/${id}/photo?kind=${moving ? 'moved' : 'arrival'}`, { method: 'POST', blob })).id;
-        await api(`/packages/${id}/${moving ? 'move' : 'arrive'}`, { method: 'POST', json: { location: location_, photo_id } });
+        const trkEl = document.getElementById('trk');
+        await api(`/packages/${id}/${moving ? 'move' : 'arrive'}`, { method: 'POST', json: { location: location_, photo_id, tracking: trkEl ? trkEl.value : undefined } });
         toast(moving ? 'Moved' : 'Logged as arrived');
         location.hash = `#/p/${id}`;
       } catch (e) { err.textContent = e.message; btn.disabled = false; btn.textContent = 'Try again'; }
