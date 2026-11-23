@@ -32,6 +32,35 @@
   const fmtDay = (d) => d ? new Date(d + 'T12:00:00Z').toLocaleDateString('en-US', { timeZone: 'UTC', weekday: 'short', month: 'short', day: 'numeric' }) : '';
   const todayET = () => new Intl.DateTimeFormat('en-CA', { timeZone: TZ }).format(new Date());
 
+  // Where to track a package: Amazon's own page (from the order + shipment ids the email
+  // scan saved), otherwise the carrier's page for the tracking number.
+  function trackUrl(p) {
+    const q = encodeURIComponent;
+    const amz = /^amazon:([\d-]+):([A-Za-z0-9]+)$/.exec(p.source_ref || '');
+    if (amz) return `https://www.amazon.com/progress-tracker/package?orderId=${q(amz[1])}&shipmentId=${q(amz[2])}&packageIndex=0`;
+    const t = (p.tracking || '').replace(/\s+/g, '').toUpperCase();
+    const carrier = (p.carrier || '').toLowerCase();
+    if (t) {
+      if (/^1Z[0-9A-Z]{16}$/.test(t) || carrier.includes('ups')) return `https://www.ups.com/track?tracknum=${q(t)}`;
+      if (/^TBA\d+$/.test(t)) return `https://track.amazon.com/tracking/${q(t)}`;
+      if (carrier.includes('fedex')) return `https://www.fedex.com/fedextrack/?trknbr=${q(t)}`;
+      if (carrier.includes('usps') || /^9[1-5]\d{18,24}$/.test(t) || /^[A-Z]{2}\d{9}US$/.test(t)) return `https://tools.usps.com/go/TrackConfirmAction?tLabels=${q(t)}`;
+      if (carrier.includes('dhl')) return `https://www.dhl.com/us-en/home/tracking/tracking-express.html?tracking-id=${q(t)}`;
+      if (/^(\d{12}|\d{15}|\d{20}|\d{22})$/.test(t)) return `https://www.fedex.com/fedextrack/?trknbr=${q(t)}`;
+      return `https://www.google.com/search?q=${q(t + ' tracking')}`;
+    }
+    if (/amazon/i.test(p.vendor || '') && /^\d{3}-\d{7}-\d{7}$/.test(p.order_number || '')) {
+      return `https://www.amazon.com/gp/your-account/order-details?orderID=${q(p.order_number)}`;
+    }
+    return null;
+  }
+  // Short reference for the list: the end of the tracking number is what you match on a label.
+  function shortRef(p) {
+    if (p.tracking) { const t = p.tracking.replace(/\s+/g, ''); return `Tracking …${t.slice(-8)}`; }
+    if (p.order_number) return `Order ${p.order_number}`;
+    return '';
+  }
+
   function pills(p) {
     const out = [];
     if (p.flag_carrier_delivered) out.push(`<span class="pill red">Carrier says delivered ${esc(fmtD(p.carrier_delivered_at))}</span>`);
@@ -228,10 +257,12 @@
         if (status === 'all') sub.unshift(p.status);
         sub.push(p.recipient_name ? `for ${p.recipient_name}` : (p.label_name ? `label: ${p.label_name}` : ''));
         if (p.vendor) sub.push(p.vendor);
+        const ref = shortRef(p);
         return `<a class="item" href="#/p/${p.id}">
           <div class="thumb" ${p.photo_id ? `style="background-image:url('/api/photos/${p.photo_id}')"` : ''}>${p.photo_id ? '' : '📦'}</div>
           <div class="body"><div class="title">${esc(p.description)}</div>
-            <div class="meta">${sub.filter(Boolean).map(esc).join(' · ')}</div>${pills(p)}</div></a>`;
+            <div class="meta">${sub.filter(Boolean).map(esc).join(' · ')}</div>
+            ${ref ? `<div class="meta ref">${esc(ref)}</div>` : ''}${pills(p)}</div></a>`;
       }).join('');
     }
     let t; qEl.oninput = () => { clearTimeout(t); t = setTimeout(() => load().catch((e) => toast(e.message)), 250); };
@@ -268,6 +299,10 @@
     if (p.status === 'expected' || p.status === 'missing') actions += `<a class="btn primary block" href="#/p/${id}/arrive">It's here — log arrival</a>`;
     if (p.status === 'arrived') actions += `<a class="btn primary block" href="#/p/${id}/collect">Someone is leaving with it</a>
       <a class="btn block" href="#/p/${id}/move">It moved — new spot</a>`;
+    const tu = trackUrl(p);
+    if (tu && (p.status === 'expected' || p.status === 'missing')) {
+      actions += `<a class="btn block" href="${esc(tu)}" target="_blank" rel="noopener">Track package${/amazon\.com/.test(tu) ? ' on Amazon' : ''} ↗</a>`;
+    }
     if (p.status !== 'collected' || me.is_admin) actions += `<a class="btn block" href="#/p/${id}/edit">Edit details</a>`;
     const statusBtns = [];
     if (p.status === 'expected') statusBtns.push(['missing', 'Mark missing'], ['cancelled', 'Not coming (cancelled/returned)']);
@@ -288,7 +323,7 @@
           ${kv('Name on label', esc(p.label_name || ''))}
           ${kv('From', esc(p.vendor || ''))}
           ${kv('Carrier', esc(p.carrier || ''))}
-          ${kv('Tracking', esc(p.tracking || ''))}
+          ${kv('Tracking', p.tracking ? (trackUrl(p) ? `<a href="${esc(trackUrl(p))}" target="_blank" rel="noopener">${esc(p.tracking)}</a>` : esc(p.tracking)) : '')}
           ${kv('Order #', esc(p.order_number || ''))}
           ${kv('Expected', esc(fmtDay(p.expected_date)))}
           ${kv('Carrier status', esc((p.carrier_status || '').replace(/_/g, ' ')))}
