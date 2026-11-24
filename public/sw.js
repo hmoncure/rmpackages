@@ -1,7 +1,25 @@
-// Office Packages service worker — notifications ONLY.
-// Deliberately no 'fetch' handler and no caching: the site is always loaded from the network.
+// Office Packages service worker — notifications + installability.
+// NOTHING is cached: every request goes to the network. The fetch handler exists because
+// Chrome on Android only installs a site as a real app (not a shortcut) when its worker
+// handles page loads; it answers page loads from the network and shows a plain offline
+// message when there is no signal. Every other request is left alone entirely.
+const VERSION = 'v2';
 self.addEventListener('install', () => self.skipWaiting());
-self.addEventListener('activate', (e) => e.waitUntil(self.clients.claim()));
+self.addEventListener('activate', (e) => e.waitUntil((async () => {
+  for (const k of await caches.keys()) await caches.delete(k); // belt and braces: no caches, ever
+  await self.clients.claim();
+})()));
+
+const OFFLINE_HTML = `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Office Packages</title><body style="font:16px system-ui;padding:24px;color:#1c2529;background:#f4f6f7">
+<h2>No connection</h2><p>Office Packages needs the internet. Check your signal or Wi-Fi, then try again.</p>
+<button onclick="location.reload()" style="font:inherit;padding:12px 16px;border-radius:10px;border:0;background:#53BDC0;color:#fff">Try again</button></body>`;
+
+self.addEventListener('fetch', (event) => {
+  if (event.request.mode !== 'navigate') return; // APIs, photos, scripts: browser handles them normally
+  event.respondWith(fetch(event.request).catch(() =>
+    new Response(OFFLINE_HTML, { status: 503, headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' } })));
+});
 
 self.addEventListener('push', (event) => {
   let d = {};

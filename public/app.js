@@ -387,7 +387,7 @@
     if (isIOS && !standalone) {
       body = `<div class="card"><h2 style="margin-top:0">iPhone: one-time setup</h2>
         <ol class="steps"><li>In Safari, tap the <strong>Share</strong> button (square with an arrow).</li>
-        <li>Choose <strong>Add to Home Screen</strong>, then <strong>Add</strong>.</li>
+        <li>Choose <strong>Add to Home Screen</strong> (scroll down the list if you don't see it). If there's an <strong>Open as Web App</strong> switch, leave it ON. Tap <strong>Add</strong>.</li>
         <li>Open <strong>Packages</strong> from your Home Screen, sign in, and come back to this page (tap <strong>Alerts</strong> at the top).</li></ol>
         <p class="small muted">Apple only allows notifications for sites opened from the Home Screen.</p></div>`;
     } else if (!supported) {
@@ -402,8 +402,21 @@
         <div class="actions">${sub ? '<button class="btn block" id="test">Send a test notification</button><button class="btn block danger" id="off">Turn off on this device</button>'
           : '<button class="btn primary block" id="on">Turn on notifications</button>'}</div>`;
     }
+    const isAndroid = /Android/.test(navigator.userAgent);
+    const install = standalone ? '' : (window.__installPrompt
+      ? '<div class="actions"><button class="btn block" id="install">Install as an app</button></div>'
+      : (isAndroid ? `<div class="card small"><strong>To install as an app:</strong> Chrome ⋮ menu → <strong>Install app</strong>
+          (or <strong>Add to Home screen</strong> → <strong>Install</strong>, not “Create shortcut”).
+          If you already made a shortcut, delete it first. If the option is missing, close the page and open it again — Chrome
+          only offers to install after a site has been used once.</div>` : ''));
     $app.innerHTML = `<p><a href="#/">← Back</a></p><h1>Notifications</h1>
-      <p class="muted">${me.is_admin ? 'You’ll get a notification when the email scan finds an Amazon package that needs its tracking number. Tap it to add the number.' : 'Notifications for your packages.'}</p>${body}`;
+      <p class="muted">${me.is_admin ? 'You’ll get a notification when the email scan finds an Amazon package that needs its tracking number. Tap it to add the number.' : 'Notifications for your packages.'}</p>${install}${body}`;
+    const ib = document.getElementById('install');
+    if (ib) ib.onclick = async () => {
+      const ev = window.__installPrompt; window.__installPrompt = null;
+      ev.prompt(); const c = await ev.userChoice;
+      toast(c.outcome === 'accepted' ? 'Installing…' : 'Not installed'); viewNotify();
+    };
     const on = document.getElementById('on');
     if (on) on.onclick = async () => {
       try {
@@ -794,6 +807,13 @@
       await api(`/admin/tokens/${b.dataset.revoke}/revoke`, { method: 'POST' }); viewAdmin();
     });
   }
+
+  // Register the worker on every visit: Chrome only treats the site as installable once it has
+  // seen one controlling the page. It caches nothing (see sw.js).
+  if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => {});
+  // Chrome's own install offer, kept so the Alerts page can show an Install button.
+  window.addEventListener('beforeinstallprompt', (e) => { e.preventDefault(); window.__installPrompt = e; });
+  window.addEventListener('appinstalled', () => { window.__installPrompt = null; toast('Installed'); });
 
   route();
 })();
