@@ -23,7 +23,7 @@
     try { data = await r.json(); } catch { /* empty */ }
     if (r.status === 401 && !path.startsWith('/login')) { me = null; location.hash = '#/login'; throw new Error('Please sign in.'); }
     if (r.status === 403 && data && data.must_change_pin) { location.hash = '#/pin'; throw new Error(data.error); }
-    if (!r.ok) throw new Error((data && data.error) || `Request failed (${r.status})`);
+    if (!r.ok) throw Object.assign(new Error((data && data.error) || `Request failed (${r.status})`), { data, status: r.status });
     return data;
   }
   const fmtDT = (ts) => ts ? new Date(ts).toLocaleString('en-US', { timeZone: TZ, month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }) : '';
@@ -676,14 +676,30 @@
       if (!getSpot()) { err.textContent = 'Take a photo of where you put it.'; return; }
       if (!loc) { err.textContent = 'Say where you put it.'; return; }
       btn.disabled = true; btn.textContent = 'Saving…';
+      const logOn = async (pid) => {
+        if (getLabel()) await api(`/packages/${pid}/photo?kind=label`, { method: 'POST', blob: getLabel() });
+        const photo_id = (await api(`/packages/${pid}/photo?kind=arrival`, { method: 'POST', blob: getSpot() })).id;
+        await api(`/packages/${pid}/arrive`, { method: 'POST', json: { location: loc, photo_id } });
+      };
       try {
         const p = await api('/packages', { method: 'POST', json: { walk_in: true, description, label_name: document.getElementById('label_name').value,
           recipient_id: document.getElementById('rcp').value || null, tracking: document.getElementById('trk').value } });
-        if (getLabel()) await api(`/packages/${p.id}/photo?kind=label`, { method: 'POST', blob: getLabel() });
-        const photo_id = (await api(`/packages/${p.id}/photo?kind=arrival`, { method: 'POST', blob: getSpot() })).id;
-        await api(`/packages/${p.id}/arrive`, { method: 'POST', json: { location: loc, photo_id } });
+        await logOn(p.id);
         toast('Logged'); location.hash = `#/p/${p.id}`;
-      } catch (e) { err.textContent = e.message; btn.disabled = false; btn.textContent = 'Try again'; }
+      } catch (e) {
+        const ex = e.status === 409 && e.data && e.data.existing;
+        if (ex && (ex.status === 'expected' || ex.status === 'missing')) {
+          // It WAS on the list (same tracking number): log the arrival there instead of making a duplicate.
+          try {
+            await logOn(ex.id);
+            toast(`It was on the list as “${ex.description}” — logged there`); location.hash = `#/p/${ex.id}`;
+            return;
+          } catch (e2) { err.textContent = e2.message; }
+        } else if (ex) {
+          err.innerHTML = `${esc(e.message)} <a href="#/p/${ex.id}">Open it</a>`;
+        } else { err.textContent = e.message; }
+        btn.disabled = false; btn.textContent = 'Try again';
+      }
     };
   }
 

@@ -268,6 +268,20 @@ function readFields(body, { requireDescription }) {
 app.post('/api/packages', requireUser, express.json(), wrap(async (req, res) => {
   const f = readFields(req.body, { requireDescription: true });
   const walkIn = !!req.body.walk_in;
+  // Same tracking number = same box. Never create a second package for it.
+  if (f.tracking) {
+    const ex = (await pool.query(
+      `SELECT id, status, description FROM package WHERE upper(tracking) = $1 AND status IN ('expected','arrived','missing') ORDER BY id LIMIT 1`,
+      [f.tracking])).rows[0];
+    if (ex) {
+      return res.status(409).json({
+        error: ex.status === 'arrived'
+          ? `That tracking number is already logged as arrived: “${ex.description}”.`
+          : `That tracking number belongs to “${ex.description}”, which is on the list. Log the arrival on that one.`,
+        existing: ex,
+      });
+    }
+  }
   const id = await tx(async (c) => {
     const cols = Object.keys(f);
     const vals = cols.map((k) => f[k]);
