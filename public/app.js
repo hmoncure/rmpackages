@@ -77,14 +77,15 @@
   }
 
   // Shrink a camera photo to ~1600px JPEG before upload (phones take 4–12 MB shots).
-  async function shrink(file) {
+  async function shrink(file, maxSide = 1600, quality = 0.82) {
     try {
       const bmp = await createImageBitmap(file, { imageOrientation: 'from-image' });
-      const scale = Math.min(1, 1600 / Math.max(bmp.width, bmp.height));
+      const scale = Math.min(1, maxSide / Math.max(bmp.width, bmp.height));
       const c = document.createElement('canvas');
       c.width = Math.round(bmp.width * scale); c.height = Math.round(bmp.height * scale);
-      c.getContext('2d').drawImage(bmp, 0, 0, c.width, c.height);
-      return await new Promise((res) => c.toBlob(res, 'image/jpeg', 0.82));
+      const g = c.getContext('2d'); g.fillStyle = '#fff'; g.fillRect(0, 0, c.width, c.height);
+      g.drawImage(bmp, 0, 0, c.width, c.height);
+      return await new Promise((res) => c.toBlob(res, 'image/jpeg', quality));
     } catch {
       return file; // browser can't decode (e.g. HEIC on desktop) — send as is
     }
@@ -715,11 +716,16 @@
 
   // ---------- add / edit ----------
   async function viewEdit(id, mode) {
-    const p = id ? await api(`/packages/${id}`) : {};
+    const p = id ? await api(`/packages/${id}`) : { recipient_id: me.can_collect ? me.id : null };
     const v = (k) => esc(p[k] ?? '');
     $app.innerHTML = `<p><a href="${id ? `#/p/${id}` : '#/'}">← Back</a></p>
       <h1>${id ? 'Edit package' : 'Add a package going to the office'}</h1>
+      ${id ? '' : `<div class="card shotbox"><button type="button" class="btn primary block" id="fromshot">📷 Fill in from a screenshot</button>
+        <p class="small muted" style="margin:8px 0 0">Screenshot the order or tracking page (Amazon app, store email…) and pick it here. Check the details, then Add.</p>
+        <input type="file" id="shotfile" accept="image/*" hidden><div id="shotres"></div></div>
+        <p class="muted small" style="text-align:center;margin:4px 0 8px">— or type it in —</p>`}
       <form id="f">
+      <input type="hidden" name="label_name" value="${v('label_name')}">
       <label class="f">What is it?<input name="description" required value="${v('description')}" placeholder="e.g. Printer toner"></label>
       <label class="f">For<select name="recipient_id"><option value="">—</option>${people.map((x) => `<option value="${x.id}" ${p.recipient_id === x.id ? 'selected' : ''}>${esc(x.name)}</option>`).join('')}</select></label>
       <label class="f">From (store / sender)<input name="vendor" value="${v('vendor')}" placeholder="Amazon, Home Depot…"></label>
@@ -732,11 +738,66 @@
       <p class="err" id="err"></p>
       <button class="btn primary block">${id ? 'Save changes' : 'Add package'}</button></form>`;
     if (!id) { const d = $app.querySelector('[name=expected_date]'); if (!d.value) d.value = ''; d.min = todayET().slice(0, 4) + '-01-01'; }
-    document.getElementById('f').onsubmit = async (ev) => {
+    let shotBlob = null; // the screenshot the details came from, attached to what gets added
+    const form = document.getElementById('f');
+    const fill = (x) => {
+      for (const k of ['description', 'vendor', 'carrier', 'tracking', 'order_number', 'expected_date', 'label_name']) {
+        if (x[k] && form.elements[k]) form.elements[k].value = x[k];
+      }
+    };
+    if (!id) {
+      const file = document.getElementById('shotfile');
+      const res = document.getElementById('shotres');
+      document.getElementById('fromshot').onclick = () => file.click();
+      file.onchange = async () => {
+        const f = file.files[0]; file.value = '';
+        if (!f) return;
+        res.innerHTML = '<p class="muted">Reading the screenshot… (about 10 seconds)</p>';
+        try {
+          shotBlob = await shrink(f, 2000, 0.9);
+          const out = await api('/extract', { method: 'POST', blob: shotBlob });
+          const pk = out.packages;
+          const warn = (x) => [
+            x.existing ? `<div class="banner amber">Already on the list: <a href="#/p/${x.existing.id}">${esc(x.existing.description)}</a> (${esc(x.existing.status)}).</div>` : '',
+            x.ship_to_office === false ? `<div class="banner red">This is NOT going to the office — ship-to: ${esc(x.ship_to || 'another address')}.</div>` : '',
+          ].join('');
+          if (!pk.length) {
+            res.innerHTML = `<div class="banner amber">Couldn't find a package in that screenshot${out.note ? ': ' + esc(out.note) : ''}. Type it in below.</div>`;
+          } else if (pk.length === 1) {
+            fill(pk[0]);
+            res.innerHTML = `<div class="banner" style="background:#e9f7f7;color:var(--accent-ink)">Filled in below — please check it, then tap <strong>Add package</strong>.</div>
+              ${warn(pk[0])}${out.note ? `<p class="small muted">Note: ${esc(out.note)}</p>` : ''}`;
+            form.scrollIntoView({ behavior: 'smooth' });
+          } else {
+            res.innerHTML = `<p><strong>${pk.length} shipments found.</strong> Tick the ones to add:</p>
+              ${pk.map((x, i) => `<label class="check card" style="align-items:flex-start"><input type="checkbox" data-i="${i}" ${x.existing || x.ship_to_office === false ? '' : 'checked'}>
+                <span><strong>${esc(x.description || 'Package')}</strong><br><span class="small muted">${esc([x.vendor, x.expected_date ? 'due ' + fmtDay(x.expected_date) : '', x.tracking || x.order_number].filter(Boolean).join(' · '))}</span>${warn(x)}</span></label>`).join('')}
+              ${out.note ? `<p class="small muted">Note: ${esc(out.note)}</p>` : ''}
+              <button type="button" class="btn primary block" id="addall">Add the ticked ones</button>`;
+            document.getElementById('addall').onclick = async (ev) => {
+              const btn = ev.currentTarget; btn.disabled = true;
+              const rid = form.elements.recipient_id.value || null;
+              let n = 0, last = null;
+              try {
+                for (const cb of res.querySelectorAll('input[type=checkbox]:checked')) {
+                  const x = pk[Number(cb.dataset.i)];
+                  const r = await api('/packages', { method: 'POST', json: { ...x, recipient_id: rid } });
+                  await api(`/packages/${r.id}/photo?kind=screenshot`, { method: 'POST', blob: shotBlob }).catch(() => {});
+                  n++; last = r.id;
+                }
+                toast(`Added ${n}`); location.hash = n === 1 ? `#/p/${last}` : '#/list/expected';
+              } catch (e) { btn.disabled = false; toast(e.message); }
+            };
+          }
+        } catch (e) { res.innerHTML = `<div class="banner amber">${esc(e.message)}</div>`; }
+      };
+    }
+    form.onsubmit = async (ev) => {
       ev.preventDefault();
       const body = Object.fromEntries(new FormData(ev.target).entries());
       try {
         const r = id ? await api(`/packages/${id}`, { method: 'PATCH', json: body }) : await api('/packages', { method: 'POST', json: body });
+        if (!id && shotBlob) await api(`/packages/${r.id}/photo?kind=screenshot`, { method: 'POST', blob: shotBlob }).catch(() => {});
         toast('Saved'); location.hash = `#/p/${r.id}`;
       } catch (e) { document.getElementById('err').textContent = e.message; }
     };

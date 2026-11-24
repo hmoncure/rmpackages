@@ -10,6 +10,7 @@ const { pool, migrate, tx } = require('./lib/db');
 const storage = require('./lib/storage');
 const mail = require('./lib/mail');
 const push = require('./lib/push');
+const claude = require('./lib/claude');
 
 const PORT = Number(process.env.PORT || 3020);
 const APP_URL = (process.env.APP_URL || `http://localhost:${PORT}`).replace(/\/$/, '');
@@ -305,7 +306,7 @@ app.post('/api/packages/:id(\\d+)/photo', requireUser,
   wrap(async (req, res) => {
     const id = Number(req.params.id);
     const kind = String(req.query.kind || 'arrival');
-    if (!['arrival', 'label', 'moved', 'collected'].includes(kind)) throw new HttpError(400, 'Bad photo kind.');
+    if (!['arrival', 'label', 'moved', 'collected', 'screenshot'].includes(kind)) throw new HttpError(400, 'Bad photo kind.');
     if (!Buffer.isBuffer(req.body) || req.body.length < 1000) throw new HttpError(400, 'No photo received.');
     const exists = await pool.query('SELECT 1 FROM package WHERE id = $1', [id]);
     if (!exists.rowCount) throw new HttpError(404, 'No such package.');
@@ -315,6 +316,41 @@ app.post('/api/packages/:id(\\d+)/photo', requireUser,
       'INSERT INTO photo (package_id, kind, storage_key, bytes, taken_by) VALUES ($1,$2,$3,$4,$5) RETURNING id',
       [id, kind, key, req.body.length, req.user.id]);
     res.status(201).json({ id: r.rows[0].id });
+  }));
+
+// Read an order / shipping screenshot and suggest the package details. Nothing is saved
+// here: the person checks the suggestions, then the normal Add creates the package.
+app.get('/api/extract/enabled', requireUser, (req, res) => res.json({ enabled: claude.enabled() }));
+app.post('/api/extract', requireUser,
+  express.raw({ type: ['image/jpeg', 'image/png', 'image/webp'], limit: '12mb' }),
+  wrap(async (req, res) => {
+    if (!Buffer.isBuffer(req.body) || req.body.length < 1000) throw new HttpError(400, 'No screenshot received.');
+    const out = await claude.readScreenshot(req.body, req.get('Content-Type'), todayET());
+    const packages = [];
+    for (const raw of out.packages) {
+      const p = {
+        description: clean(raw.description, 300),
+        vendor: clean(raw.vendor, 100),
+        carrier: clean(raw.carrier, 60),
+        tracking: clean(raw.tracking, 100) ? clean(raw.tracking, 100).replace(/\s+/g, '').toUpperCase() : null,
+        order_number: clean(raw.order_number, 100) ? clean(raw.order_number, 100).replace(/[‎‏‪-‮]/g, '') : null,
+        expected_date: isDate(raw.expected_date) ? raw.expected_date : null,
+        label_name: clean(raw.label_name, 100),
+        ship_to: clean(raw.ship_to, 300),
+        ship_to_office: typeof raw.ship_to_office === 'boolean' ? raw.ship_to_office : null,
+        status: clean(raw.status, 30),
+      };
+      if (!p.description && !p.tracking && !p.order_number) continue;
+      // Already tracked? (by tracking number, or by the same order number)
+      const ex = await pool.query(
+        `SELECT id, status, description FROM package
+          WHERE ($1::text IS NOT NULL AND upper(tracking) = $1) OR ($2::text IS NOT NULL AND order_number = $2)
+          ORDER BY id LIMIT 1`, [p.tracking, p.order_number]);
+      if (ex.rows[0]) p.existing = ex.rows[0];
+      packages.push(p);
+    }
+    console.log(`[extract] ${req.user.name}: ${packages.length} package(s)`, out.usage ? `in=${out.usage.input_tokens} out=${out.usage.output_tokens}` : '');
+    res.json({ packages, note: clean(out.note, 500) });
   }));
 
 app.get('/api/photos/:id(\\d+)', requireUser, wrap(async (req, res) => {
